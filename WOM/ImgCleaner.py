@@ -1,8 +1,10 @@
+import copy
 import os
 import shutil
 import subprocess
 import re
 from collections import Counter
+from tkinter import filedialog
 import natsort
 import numpy as np
 import photoshop.api as ps
@@ -10,9 +12,11 @@ import wmi
 from photoshop.api import Application
 import cv2
 from paddleocr import PaddleOCR
-
+import TypesetPsd
 
 PS_VERSION = None
+# TODO Inserire assieme al nome del watermark, dei parametri x1,y1,x2,y2 da utilizzare per adattare la selezione di pulizia del WM
+watermark = ["lunarscan"]
 
 
 # Verifica la presenza della GPU
@@ -35,7 +39,6 @@ def get_ps_version():
 
     # 'Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName, DisplayVersion | Format-Table –AutoSize | findstr Photoshop'
     try:
-        # todo capire cosa usare al posto di subprocess
         result = subprocess.run(["powershell", "-Command", command], capture_output=True, text=True)
 
         if result.returncode == 0:
@@ -61,12 +64,22 @@ def get_ps_version():
         return None
 
 
-# Salvataggio dell'immagine
-def ps_save_image(initial_image: str, exit_psd=True):
+# Crea il path indicato se non esiste
+def check_path_existence(path_to_check: str):
+    if not os.path.exists(path_to_check):
+        os.makedirs(path_to_check)
+
+
+# Salvataggio dell'immagine con PS
+def ps_save_image(initial_image: str, exit_psd=False, position_save: str = None):
     try:
-        app = Application(version=PS_VERSION)
+        app = Application()
         doc = app.open(initial_image)
-        file_name, file_extension = os.path.splitext(initial_image)
+        file_name, file_extension = os.path.splitext(os.path.basename(initial_image))
+        if position_save:
+            initial_image = os.path.dirname(initial_image) + position_save
+            check_path_existence(initial_image)
+            initial_image += (file_name + file_extension)
         if file_extension.lower() in [".jpg", ".jpeg"]:
             doc.saveAs(initial_image, ps.JPEGSaveOptions(quality=10))
         elif file_extension.lower() == ".png":
@@ -81,11 +94,12 @@ def ps_save_image(initial_image: str, exit_psd=True):
 
 
 # Azioni richieste a Photoshop
-def ps_actions(ps_image: str, action_name: str,
+def ps_actions(ps_image: str, action_name: str, layer_name: str = "Auto-Clean", doc: Application.activeDocument = None,
                x_sx: float | int = 0, y_up: float | int = 0, x_dx: float | int = 0, y_down: float | int = 0):
     try:
-        app = Application(version=PS_VERSION)
-        doc = app.open(ps_image)
+        app = Application()
+        if doc is None:
+            doc = app.open(ps_image)
 
         if action_name.lower() == "start":
             # Conversione in RGB per poter usare il GenerativeFill
@@ -111,19 +125,32 @@ def ps_actions(ps_image: str, action_name: str,
             doc.selection.expand(11)
             app.DoAction('AzioneFill', 'AutoCleaner')
             doc.selection.deselect()
+        elif action_name.lower() == "only_visible":
+            layer_found = False
+            for layer in doc.layers:
+                if layer.name != layer_name:
+                    if layer_found:
+                        layer.visible = False
+                else:
+                    layer_found = True
+            app.doAction('LevelOne', 'AutoCleaner')
+        elif action_name.lower() == "all_visible":
+            for layer in doc.layers:
+                layer.visible = True
+
     except Exception as e:
         print(f"Errore durante l'esecuzione dell'azione: {e}")
 
 
 def get_center(box):
     """Calcola il centro di un box."""
-    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = box[:4]
     return np.array([(x1 + x2) / 2, (y1 + y2) / 2])
 
 
 def get_size(box):
     """Calcola la dimensione di un box."""
-    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = box[:4]
     return np.linalg.norm(np.array([x2 - x1, y2 - y1]))
 
 
@@ -147,9 +174,9 @@ def merge_boxes(boxes, threshold_ratio):
                 new_center = get_center(new_box)
                 if np.linalg.norm(center - new_center) < threshold:
                     # Unisci i box prendendo il minimo x1, y1 e il massimo x2, y2
-                    x1, y1, x2, y2 = box
-                    nx1, ny1, nx2, ny2 = new_box
-                    new_boxes[i] = [min(x1, nx1), min(y1, ny1), max(x2, nx2), max(y2, ny2)]
+                    x1, y1, x2, y2, text = box
+                    nx1, ny1, nx2, ny2, new_text = new_box
+                    new_boxes[i] = [min(x1, nx1), min(y1, ny1), max(x2, nx2), max(y2, ny2), new_text + " " + text]
                     break
             else:
                 new_boxes.append(box)
@@ -212,8 +239,8 @@ def get_pixel_colors_list(x1, x2, y1, y2, image):
 
 
 # Analizza il colore dei pixel attorno al box
-def get_perimeter_colors(box, image, expand, tolerance):
-    x1, y1, x2, y2 = expand_box(box, expand + 1, image)
+def get_perimeter_colors(box, image, expand, tolerance: float = 0.85, show_percentage: bool = False):
+    x1, y1, x2, y2 = expand_box(box, expand + 2, image)
     # Conta i colori nel perimetro
     color_counts_with_expand = Counter(get_pixel_colors_list(x1, x2, y1, y2, image))
     x1, y1, x2, y2 = expand_box(box, expand, image)
@@ -235,6 +262,8 @@ def get_perimeter_colors(box, image, expand, tolerance):
 
         # Calcola la percentuale di pixel con il colore dominante
         dominant_percentage = round(total_count / total_pixels, 2)
+        if show_percentage:
+            return dominant_percentage, dominant_color
 
         # Verifica se il colore dominante supera la soglia di tolleranza
         if dominant_percentage >= tolerance:
@@ -247,124 +276,168 @@ def get_perimeter_colors(box, image, expand, tolerance):
 
 
 # In base al colore dei pixel analizzati, decide se riempire con il bianco o con il generative fill
-def analyze_and_remove(path_image, result_ocr: list[list[tuple[str, None]]], img_binary=None, clear_all: bool = False, onomatopee: list | str = ""):
+def analyze_and_remove(path_image: str, result_ocr: list[
+    list[tuple[str, None]]], psd_image: bool, mask_img: bool, png_image: bool, destination_path: str | None = None,
+                       clear_all: bool = False, onomatopee: list | str = ""):
+    if destination_path is None:
+        # TODO Utilizzare il join per evitare problemi dovuti all'inserimento manuale del path di salvataggio
+        destination_path = path_image
+    else:
+        destination_path += ("/" + os.path.basename(path_image))
     try:
-        if img_binary is None:
-            img_binary = cv2.imread(path_image)
-        #
-        # # Parole da non pulire
-        # lista_onomatopee = [
-        #     "pow", "boom", "zap", "bam", "whoosh", "crash", "splash", "sizzle", "thump", "swish",
-        #     "pop", "gulp", "tick-tock", "chomp", "zing", "buzz", "wham", "zoom", "crunch", "bang",
-        #     "slam", "crack", "swoosh", "smash", "thud", "clang", "clink", "bloop", "ping", "ding",
-        #     "clap", "rumble", "clatter", "flutter", "squeak", "squish", "screech", "roar", "hiss", "whack",
-        #     "thwack", "whee", "whip", "knock", "ting", "rattle", "boing", "huff", "puff", "whisper",
-        #     "giggle", "sigh", "gurgle", "sob", "burst", "drip", "crunchy", "plop", "shatter", "chirp",
-        #     "twinkle", "glimmer", "glitter", "burst", "shimmer", "stomp", "stumble", "growl", "chuckle", "yawn",
-        #     "thud", "tap", "rustle", "murmur", "rumble", "shuffle", "tremble", "rustle", "crackle", "clutch",
-        #     "swoop", "pounce", "stab", "flutter", "jingle", "jangle", "whistle", "scuttle", "stomp", "crawl",
-        #     "stretch", "snap", "twist", "whimper", "pitter-patter", "scamper", "squawk", "slither", "clamor", "swirl",
-        #     "drumroll", "gong", "wail", "tinkle", "buzzing", "whirr", "hum", "zoom", "squelch", "gobble",
-        #     "sizzle", "splash", "dribble", "swoosh", "bellow", "crunch", "hiccup", "crunch", "splatter", "chime",
-        #     "creak", "groan", "rustle", "stomp", "zap", "babble", "chatter", "blare", "bump", "ding-dong",
-        #     "giggle", "grumble", "slam", "snarl", "huff", "puff", "scorch", "tug", "wheeze", "wiggle",
-        #     "squelch", "stumble", "whimper", "rumble", "throb", "clang", "ding", "clunk", "sniff", "shout",
-        #     "cry", "scream", "mumble", "whack", "wheeze", "gasp", "sneak", "scamper", "splish-splash", "flutter",
-        #     "glimpse", "sigh", "squeal", "tickle", "sprinkle", "gurgling", "thump", "stagger", "howl", "wobble",
-        #     "twitch", "woop", "slurp", "hngh", "pwah", "aghh", "ang", "kyaa", "haah", "hangg", "haghh", "huh", "haeungh",
-        #     "eup", "urghh", "heup", "keuk", "hah", "urgh", "ugh", "heupgh", "euppp", "hughh", "eut"]
-
+        img_binary = cv2.imread(path_image)
+        img_height, img_width = img_binary.shape[:2]
+        mask_binary = np.ones((img_height, img_width, 4), dtype=np.uint8)
 
         not_cleaned = []  # Parole da togliere con il Generative Fill
         for coord in result_ocr:
-            tolerance = 0.88
+            tolerance = 0.85
             for repetition in range(10):
                 for box in coord:
                     # TODO Capire come utilizzare Numpy
                     try:
-                        # Controllo se la parola è una onomatopea
-                        if not box[1][0].replace(".", "").replace("?", "").replace("!", "").lower() in onomatopee and box[1][1] >= 0.5:
-                            x1, y1, x2, y2 = int(box[0][0][0]), int(box[0][0][1]), int(box[0][2][0]), int(box[0][2][1])
-                            for exp in range(0, 8, 1):
-                                result_color = get_perimeter_colors(box=[x1, y1, x2, y2], image=img_binary, expand=exp, tolerance=tolerance)
-                                if result_color is not None:
-                                    # Box circondato dallo stesso colore
-                                    img_binary = cv2.rectangle(img_binary, (int(x1) - 5, int(y1) - 6), (int(x2) + 5, int(y2) + 6), (result_color[0], result_color[1], result_color[2]), -1)
-                                    print(f"Test pulito: {box[1][0]} con Thres: {box[1][1]}")
-                                    coord.remove(box)  # Rimozione parola pulita
-                                    break
-                            # La il box non è stato pulito
-                            if repetition == 9 and box[1][1] >= 0.64:
-                                not_cleaned.append([x1, y1, x2, y2])
-                                print(f"Testo NON pulito -> {box[1][0]} con Thres: {box[1][1]}")
+                        x1, y1, x2, y2 = int(box[0][0][0]), int(box[0][0][1]), int(box[0][2][0]), int(box[0][2][1])
+                        # TODO Studiare un metodo automatico per il riconoscere la grandezza del watermark
+                        if any(item in box[1][0].lower() for item in watermark):
+                            # Modifica delle coordinate per selezionare l'intero watermark
+                            # Attualmente queste coordinate sono specifiche per "lunarscan" in sextudy
+                            x1 -= 50
+                            y1 -= 6
+                            x2 += 10
+                            y2 += 6
+
+                        # Date le coordinate del box di contenimento della parola, espande il box un pixel alla volta (max.8)
+                        # I box sono possono esser più piccoli della parola (perché ES: hanno dei bordi aggiuntivi) e per questo espandiamo
+                        for exp in range(0, 8, 1):
+                            # Controlla il colore di ogni pixel che circonda il box
+                            # Se rileva una dominante netta, restituisce il colore
+                            result_color = get_perimeter_colors(box=[x1, y1, x2, y2], image=img_binary, expand=exp,
+                                                                tolerance=tolerance)
+                            # Box circondato dallo stesso colore
+                            if result_color is not None:
+                                # Applico modifiche su copia dell'immagine
+                                # Se si vuole il png ma non si userà ps
+                                max_percent = [exp,
+                                               get_perimeter_colors(box=[x1, y1, x2, y2], image=img_binary, expand=exp,
+                                                                    show_percentage=True)[0]]
+                                for line in range(exp + 1, exp + 6, 1):
+                                    temp_perc = get_perimeter_colors(box=[x1, y1, x2, y2], image=img_binary,
+                                                                     expand=line, show_percentage=True)
+                                    if result_color == temp_perc[1]:
+                                        if temp_perc[0] > max_percent[1]:
+                                            max_percent = [line, temp_perc[0]]
+                                            if temp_perc[0] >= 0.98:
+                                                break
+                                img_binary = cv2.rectangle(img_binary,
+                                                           (int(x1) - max_percent[0], int(y1) - max_percent[0]),
+                                                           (int(x2) + max_percent[0], int(y2) + max_percent[0]),
+                                                           (result_color[0], result_color[1], result_color[2]), -1)
+                                # Applico modifiche su un png trasparente
+                                if psd_image or mask_img or clear_all:
+                                    mask_binary = cv2.rectangle(mask_binary,
+                                                                (int(x1) - max_percent[0], int(y1) - max_percent[0]),
+                                                                (int(x2) + max_percent[0], int(y2) + max_percent[0]), (
+                                                                    result_color[0] - 1, result_color[1] - 1,
+                                                                    result_color[2] - 1, 255), -1)
+                                print(f"Testo pulito: {box[1][0]} -- affidabilità: {box[1][1]}")
+                                coord.remove(box)  # Rimozione parola pulita
+                                break
+                        # All'ultima iterazione i box non ancora puliti vengono inseriti in una lista
+                        if repetition == 9 and clear_all:
+                            not_cleaned.append([x1, y1, x2, y2, box[1][0]])
+                            print(f"DA PULIRE con PS: {box[1][0]}")
+
                     except Exception as e:
                         print(f"Errore durante l'elaborazione del box: {e}")
-                if repetition == 9:
-                    save_no_balloon_img(path_image, "/temp_clean/", img_binary)
-
-            # Se si vuole pulire l'intera immagine e c'è ancora almeno una parola da togliere
-            if clear_all and len(not_cleaned) > 0:
                 try:
-                    percorso = os.path.dirname(path_image)
-                    file_name = os.path.basename(path_image)
-                    # Merge dei box di testo adiacenti (facilita il fill di Photoshop)
-                    merge_remaining_boxes = merge_boxes(not_cleaned, 1)
-                    file_to_open = percorso + "/temp_clean/" + file_name
-                    ps_actions(ps_image=file_to_open, action_name="start")
-                    for coords in merge_remaining_boxes:
-                        ps_actions(ps_image=file_to_open, action_name="selection", x_sx=coords[0], y_up=coords[1], x_dx=coords[2], y_down=coords[3])
-                        ps_actions(action_name="generative_fill", ps_image=file_to_open)
-                    ps_save_image(file_to_open)
-                    return True
-
+                    if repetition == 9:
+                        # Se non bisogna utilizzare il generative fill, si salvano le immagini senza aprire PS
+                        if not clear_all:
+                            if png_image:
+                                save_img_balloon_cleaned(destination_path, "/clean_png/", img_binary)
+                            if mask_img:
+                                save_img_balloon_cleaned(destination_path, "/clean_mask/", mask_binary)
+                            if psd_image:
+                                # Salvataggio temporaneo della maschera per creare il psd successivamente
+                                save_img_balloon_cleaned(path_image, "/temp_clean/", mask_binary)
+                        else:
+                            # C'è bisogno di PS quindi i file verranno salvati dopo il generative fill
+                            save_img_balloon_cleaned(path_image, "/temp_clean/", mask_binary)
                 except Exception as e:
-                    print(f"Errore durante il merge dei box di testo oppure generative fill: {e}")
-            else:
-                return False
+                    print(f"Errore durante il salvataggio dell'immagine con i balloon puliti: {e}")
+
+            # Se si vuole pulire l'intera immagine
+            if clear_all:
+                # Se c'è ancora almeno una parola da togliere con PS
+                if len(not_cleaned) > 0:
+                    try:
+                        parent_path = os.path.dirname(path_image)
+                        file_name = os.path.basename(path_image)
+                        # Merge dei box di testo adiacenti (facilita il generative fill di PS)
+                        merge_remaining_boxes = merge_boxes(not_cleaned, 1)
+                        file_to_open = parent_path + "/temp_clean/" + file_name
+                        # Crea un psd con RAW e maschera con i balloon puliti. In questa maniera è possibile applicare il GF (impossibile applicarlo solo sulla maschera)
+                        doc = assemble_psd(cleaned_img=file_to_open, raw_img=path_image)
+                        for coords in merge_remaining_boxes:
+                            # Esclude i testo di max 3 lettere (utile per evitare la pulizia di simboli erroneamente riconosciuti come testo)
+                            if len(coords[4]) > 4:
+                                # Effettua la selezione su PS del box
+                                ps_actions(ps_image=path_image, action_name="selection", x_sx=coords[0], y_up=coords[1],
+                                           x_dx=coords[2], y_down=coords[3])
+                                # Applica il GF sulla selezione
+                                ps_actions(action_name="generative_fill", ps_image=path_image)
+                        try:
+                            if png_image:
+                                # Salva il png con tutte le correzioni
+                                ps_save_image(path_image, position_save="/clean_png/", exit_psd=False)
+                            if mask_img:
+                                # Rende visibile solamente i livelli con le correzioni e salva
+                                ps_actions(path_image, 'only_visible')
+                                ps_save_image(path_image, position_save="/clean_mask/", exit_psd=False)
+                                ps_actions(path_image, 'all_visible')
+                        except Exception as e:
+                            print(f"Errore durante il salvataggio post generative-fill: {e}")
+
+                        return doc
+
+                    except Exception as e:
+                        print(f"Errore durante il merge dei box di testo oppure generative fill: {e}")
+                else:
+                    # Non è stato utilizzato il generative fill
+                    return None
     except Exception as e:
         print(f"Errore durante l'analisi e rimozione delle parole: {e}")
         return None
 
 
-# Salva in 'temp_clean' le immagini con i balloon puliti
-def save_no_balloon_img(img_path: str, dest_folder: str, cv2_img):
-    percorso = os.path.dirname(img_path)
-    print("Directory:", percorso)
-    if not os.path.exists(percorso + "/" + dest_folder):
-        os.makedirs(percorso + "/" + dest_folder)
+# Salva le immagini CV2
+def save_img_balloon_cleaned(img_path: str, dest_folder: str, cv2_img):
+    parent_path = os.path.dirname(img_path)
+    check_path_existence(parent_path + "/" + dest_folder)
 
-    file_con_estensione = os.path.basename(img_path)
-    print("Nome con estensione:", file_con_estensione)
+    file_name, file_extension = os.path.splitext(os.path.basename(img_path))
     # Salva l'immagine
-    cv2.imwrite(percorso + f"/{dest_folder}/" + file_con_estensione, cv2_img)
+    cv2.imwrite(parent_path + dest_folder + file_name + ".png", cv2_img)
+    print("Salvata:", parent_path + dest_folder + file_name + ".png")
 
 
-# Funzione che inserisce in un nuovo PSD l'immagine RAW e quella Auto-Cleaned
-def assemble_psd(images_path: str, clean_path: str = "", raw_files: list = None, save_path: str | None = None):
+# Funzione che inserisce in un nuovo PSD l'immagine RAW e quella pulita automaticamente
+def assemble_psd(cleaned_img: str, raw_img: str = None):
     try:
-        app = Application(version=PS_VERSION)
-        clean_files = get_images_list(images_path + clean_path)[0]
+        app = Application()
+        doc2 = app.open(cleaned_img)
+        doc2.activeLayer.name = "AutoClean"
+        doc2.selection.copy()
 
-        for raw, clean in zip(raw_files, clean_files):
-            doc2 = app.open(clean)
-            doc2.activeLayer.name = "AutoClean"
-            doc2.selection.copy()
-
-            doc1 = app.open(raw)
-            doc1.activeLayer.name = "RAW"
-            doc1.paste()
-
-            if save_path is None:
-                save_path = images_path
-            output_folder = save_path + "/PSD_Cleaned"
-            if not os.path.exists(output_folder):
-                os.makedirs(output_folder)
-
-            output_path = os.path.join(output_folder, os.path.basename(raw))
-            doc1.saveAs(output_path, ps.PhotoshopSaveOptions(), asCopy=False)
-
-            doc1.close()
-            doc2.close()
+        doc1 = app.open(raw_img)
+        # Imposta il metodo colore su RBG (il GF funziona solo così)
+        app.DoAction('beRGB', 'AutoCleaner')
+        doc1.activeLayer.name = "RAW"
+        doc1.paste()
+        auto_clean = doc1.activeLayer
+        auto_clean.name = "Auto-Clean"
+        doc2.close()
+        return doc1
     except Exception as e:
         print(f"Errore durante l'assemblaggio dei PSD: {e}")
 
@@ -391,24 +464,65 @@ def show_image(image, scale_percent):
     cv2.destroyAllWindows()
 
 
-# Analizza l'input (cartella o file), riconosce il testo, ricompone e salva il PSD
-def start_detect_processing(gpu: bool, clear_all: bool, save_and_exit: bool, img_path: str | list, destination_path: str | None = None):
+# Analizza l'input (cartella o file), riconosce il testo, type del testo
+def start_detect_processing(gpu: bool = False, clear_all: bool = False, save_and_exit: bool = False,
+                            img_path: str | list = None, psd_type=True,
+                            destination_path: str | None = None, psd_image: bool = False, mask_img: bool = True,
+                            png_image: bool = True):
     try:
-
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', ocr_order_method="det_ar", use_gpu=gpu,
-            det_db_score_mode="slow", max_text_length=200, cpu_math_library_num_threads=4, use_mp=True,
-            det_db_thresh=0.4, det_limit_side_len=17000, det_db_unclip_ratio=1.5, det_db_box_thresh=0.68, det_pse_box_thresh=0.80, e2e_pgnet_mode='accurate')
+        ocr = PaddleOCR(use_angle_cls=False, lang='en', ocr_order_method="det_ar", use_gpu=gpu,
+                        det_db_score_mode="slow", max_text_length=200, cpu_math_library_num_threads=4, use_mp=True,
+                        det_db_thresh=0.3, det_limit_side_len=17000, det_db_unclip_ratio=1.5, det_db_box_thresh=0.3,
+                        e2e_pgnet_mode='accurate', cls_thresh=0.2, drop_score=0.2, e2e_limit_side_len=17000)
 
         img_path_list_to_clean, is_dir = get_images_list(img_path)
         img_path = os.path.dirname(img_path_list_to_clean[0])
 
-        for img in img_path_list_to_clean:
-            pred_groups = ocr.ocr(img, cls=True)
-            if analyze_and_remove(path_image=img, result_ocr=pred_groups, clear_all=clear_all):
-                ps_save_image(img, True)
+        pred_list = []
+        threads = []
 
-        temp_path = "/temp_clean"
-        assemble_psd(img_path, raw_files=img_path_list_to_clean, clean_path=temp_path, save_path=destination_path)
+        # TODO Implementare il multithread per l'ocr
+        for img in img_path_list_to_clean:
+            pred_groups = ocr.ocr(img, cls=False)
+            if psd_type:
+                # Fa una copia integrale della lista poiché 'pred_groups' cambia nel tempo
+                pred_list = copy.deepcopy(pred_groups)
+
+            doc = analyze_and_remove(path_image=img, result_ocr=pred_groups, clear_all=clear_all, psd_image=psd_image,
+                                     mask_img=mask_img, png_image=png_image, destination_path=destination_path)
+
+            if psd_image:
+                # Se non è stato utilizzato il GF e quindi non il psd va ancora assemblato
+                if doc is None:
+                    doc = assemble_psd(cleaned_img=img_path + "/temp_clean/" + os.path.basename(img), raw_img=img)
+                # salvataggio del psd in posizione da input
+                if destination_path is None:
+                    destination_path = img_path
+                output_folder = destination_path + "/PSD_Cleaned"
+                check_path_existence(output_folder)
+
+                output_path = os.path.join(output_folder, os.path.basename(img))
+                doc.saveAs(output_path, ps.PhotoshopSaveOptions(), asCopy=False)
+                # Inserisce i livelli di testo nel psd
+                if psd_type:
+                    TypesetPsd.type_boxes(doc, pred_list, watermark)
+                    doc.saveAs(output_path, ps.PhotoshopSaveOptions(), asCopy=False)
+                # chiude il psd
+                if save_and_exit:
+                    doc.close()
+        # Rimozione cartella di appoggio 'temp_clean'
         remove_other_dir(img_path)
     except Exception as e:
         print(f"Errore durante l'avvio del processo di rilevamento e elaborazione: {e}")
+
+
+def start():
+    # Immagini
+    image_paths = filedialog.askopenfilenames(
+        title="Scegli la prima immagine",
+        filetypes=(("Image files", "*.png;*.jpg;*.jpeg"), ("All files", "*.*"))
+    )
+
+    return image_paths
+
+# start_detect_processing(img_path=start())
